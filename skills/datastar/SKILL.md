@@ -1,255 +1,105 @@
 ---
 name: datastar-conventions
 description: >
-  Always activate when using DataStar for SSE-driven UI. Contains correct
-  attribute syntax, CDN URLs, SDK helpers, and common patterns. Prevents
-  common integration mistakes like wrong attribute format or GET vs POST.
+  Use when building SSE-driven UI with DataStar, or deciding whether to keep it. Covers the
+  wrapper rule that keeps an SSE library out of application code, how to choose asset
+  delivery, and the delivery-level traps that cause flicker and duplicated updates. This
+  skill deliberately contains no attribute syntax, SDK signatures, or version numbers:
+  DataStar's API changes between releases, so current API detail comes from the official
+  documentation and the pinned version in your project.
 ---
 <!-- *** Maintained by AvonS/harness-eng, DON'T modify this, will be overwritten during next upgrade *** -->
 
-
 <!-- EDITORIAL GUIDELINES
-- Be terse. Use tables and code examples over prose.
-- Only include information that prevents common mistakes.
-- WRONG/CORRECT pairs for pattern matching.
+- Terse. Use tables and WRONG/CORRECT pairs over prose.
+- NO attribute syntax tables, NO SDK signatures, NO CDN URLs, NO version numbers. They are
+  the reason this skill was rewritten. Architecture and traps only.
+- Read the current official documentation for anything version-specific.
 -->
 
 ## Non-Negotiable Rules
 
-- **Read Official Docs:** Before designing or writing new Datastar integrations, read the official docs (https://data-star.dev) to ensure correct API usage.
-- **Mandatory SDK Wrapper:** Never import the Datastar SDK (e.g. `github.com/starfederation/datastar-go/...`) directly into handler functions (such as in `cmd/`). Wrap the SDK in a thin local package (e.g. `pkg/sse/`) that exposes standard library patterns.
+- **Read the official docs for the pinned version.** Before writing an integration, confirm
+  the current attribute syntax and SDK surface against the documentation and against the
+  version your project actually pins. This skill will not tell you the syntax, because a
+  stale answer here is worse than no answer.
+- **Never let the library reach application code.** No handler, command, or domain package
+  may import the SSE SDK. Put it behind one thin local package that speaks standard library
+  types. This is the single most valuable rule in this file.
+- **Version the state, or accept that you cannot reason about it.** Without a monotonic
+  version the client cannot tell a fresh update from a replayed one, and a dropped update is
+  invisible.
+- **Decide the delivery model before writing handlers.** Inline-plus-broadcast and
+  broadcast-only have different failure modes. Choose one deliberately.
 
-## Asset Loading
+## The Wrapper Rule
 
-Two options for loading DataStar JS and OAT CSS:
+Wrap the SDK in a single local package. Application code depends on your package, not on the
+vendor's, so replacing the library is a change to one directory.
 
-### Option A: Embedded (Recommended for production)
-
-Embed assets in the Go binary — no external dependencies, works in air-gapped environments:
-
-```go
-import "embed"
-
-//go:embed assets/*
-var Assets embed.FS
-
-func AssetHandler() http.Handler {
-    subFS, _ := fs.Sub(Assets, "assets")
-    return http.StripPrefix("/static/", http.FileServer(http.FS(subFS)))
-}
-
-// In main.go
-mux.Handle("GET /static/", ui.AssetHandler())
+```
+pkg/stream/          <- the only place the SDK is imported
+  stream.go          <- NewWriter, ReadSignals, PatchFragment, MergeSignals, NextVersion
+api/                 <- imports pkg/stream only
+cmd/                 <- imports pkg/stream only
 ```
 
-```html
-<!-- HTML references local static files -->
-<link rel="stylesheet" href="/static/oat.css">
-<script type="module" src="/static/datastar.js"></script>
-```
+What the wrapper must provide:
 
-**Assets to embed:**
-- `assets/datastar.js` — from SDK or CDN download
-- `assets/oat.css` — OAT component styles
-- `assets/oat.js` — OAT component logic (if needed)
+| Requirement | Why |
+| --- | --- |
+| Accepts/returns standard library types (`http.ResponseWriter`, `*http.Request`, `error`) | Application code stays free of vendor types. |
+| One function per operation the app needs, not one per SDK method | The surface you expose is the surface you maintain. |
+| Errors returned, not swallowed | A dropped update must be visible. |
+| Owns the versioning decision | One place to add a monotonic version. |
+| No business logic | It transports state; it does not decide it. |
 
-### Option B: CDN (Development only)
+If swapping the library would require edits outside `pkg/stream`, the boundary has already
+leaked.
 
-Use CDN for quick prototyping — requires internet access:
+## Asset Delivery
 
-```html
-<!-- Check go.mod for SDK version, then use matching CDN -->
-<script type="module" src="https://cdn.jsdelivr.net/gh/starfederation/datastar@{VERSION}/bundles/datastar.js"></script>
+| Situation | Use | Why |
+| --- | --- | --- |
+| Production, air-gapped, or single-binary | Vendored assets in the binary | No runtime network dependency; the binary is the deployment unit. |
+| Prototyping, demos | CDN, pinned to an exact version | Fast iteration; accept the network dependency. |
 
-<!-- Example for v1.0.0-RC.7 -->
-<script type="module" src="https://cdn.jsdelivr.net/gh/starfederation/datastar@1.0.0-RC.7/bundles/datastar.js"></script>
-```
+Rules either way:
 
-**When to use CDN:**
-- Local development with internet
-- Prototyping and demos
-- Not for production or air-gapped servers
+- **Pin exactly.** A floating CDN tag makes production behaviour depend on when the page
+  loaded. If you use a CDN in development, the same pin must be what you test against.
+- **Vendor what you ship.** A framework file fetched at runtime is a supply-chain and
+  availability dependency you did not intend.
+- **Serve your own copy of the framework CSS too.** The layout guarantees in the paired
+  skill depend on knowing the exact framework build in use.
 
-**When to use embedded:**
-- Production deployments
-- Air-gapped / highly secured servers
-- Single binary requirement
-- No external network access
+## Delivery Traps
 
-## Attribute Syntax
+These are the causes of flicker and duplicated updates. All were observed in a real project.
 
-DataStar v5+ uses **colon syntax** for attributes:
+| Trap | What actually happens | Do instead |
+| --- | --- | --- |
+| **Duplicate delivery to the acting client** | The same state is applied twice — once in the action's own response, once by broadcast. The second application re-renders, which reads as a flicker. | Deliver once, or attach a version and let the client drop what it has already applied. |
+| **Two-stage first paint** | The shell paints from the server, then real content arrives over the stream and everything below it moves. | Server-render the first real state. |
+| **No gap detection** | A dropped update leaves the UI permanently wrong with nothing indicating it happened. | Monotonic version per state; client compares and can re-request. |
+| **Synchronous work inside the request** | Intermediate states never exist on the client, so time the user spends waiting is invisible. No amount of client code can show a state the server never sent. | If the user waits, send the waiting state, then send the result. |
+| **Patch scoped too narrowly** | Part of the page updates and the rest does not, which reads as a flicker because only some elements move. | Patch the smallest genuinely self-contained region, and measure that region. |
+| **Timing flags change what is observable** | A test flag that shortens delays also removes states from the client, so conclusions drawn under it are wrong. | Observe transient states with delays raised, in a second instance. |
+| **A state that only appears conditionally** | It looks like dead markup when your driver happens not to produce the condition. | Drive the condition. A state you never reached is a state you did not test. |
+| **Streaming and buffering** | Responses that are not flushed stream nothing, so the client waits for the whole thing. | Confirm the response is actually flushed per event. |
 
-| Attribute | Syntax | Example |
-|-----------|--------|---------|
-| Signals | `data-signals` | `data-signals="{ count: 0 }"` |
-| Text binding | `data-text` | `data-text="$count"` |
-| Click handler | `data-on:click` | `data-on:click="@post('/api')"` |
-| Submit handler | `data-on:submit` | `data-on:submit.prevent="@post('/api')"` |
-| Key handler | `data-on:keydown.enter` | `data-on:keydown.enter="@post('/api')"` |
+## Choosing Whether to Keep the Library
 
-```html
-<!-- WRONG -->
-<div data-signals-count="0">
-<button data-on-click="@get('/api')">
+Keep it if the ergonomics are worth the dependency and you have absorbed the delivery traps
+above. Replace it if you need versioned state, gap detection, or single-patch delivery and
+find yourself working around the library to get them — at that point the wrapper is the
+thing you maintain and the library is only the part you cannot.
 
-<!-- CORRECT -->
-<div data-signals="{ count: 0 }">
-<button data-on:click="@post('/api')">
-```
+Whichever you choose, the wrapper boundary is what makes the decision reversible. That is the
+argument for having it regardless.
 
-## Signals Format
+## Related
 
-Signals are always JSON objects:
-
-```html
-<!-- WRONG — attribute syntax -->
-<div data-signals-count="0">
-<div data-signals-count="$initialValue">
-
-<!-- CORRECT — JSON format -->
-<div data-signals="{ count: 0 }">
-<div data-signals="{ count: $initialValue, name: '' }">
-```
-
-## Actions (GET vs POST)
-
-DataStar sends signals with **POST**, not GET:
-
-```html
-<!-- WRONG — GET doesn't send signals -->
-<button data-on:click="@get('/increment')">
-
-<!-- CORRECT — POST sends signals in request body -->
-<button data-on:click="@post('/increment')">
-
-<!-- GET is for actions that don't need signals -->
-<button data-on:click="@get('/logout')">
-```
-
-## Go SDK Helpers
-
-### Create SSE Writer
-
-```go
-import "github.com/starfederation/datastar-go/datastar"
-
-// Create SSE writer from HTTP handler
-sse := datastar.NewSSE(w, r)
-```
-
-### Read Signals from Client
-
-```go
-// Define signal structure
-type MySignals struct {
-    Count int    `json:"count"`
-    Name  string `json:"name"`
-}
-
-// Read signals from request
-var signals MySignals
-if err := datastar.ReadSignals(r, &signals); err != nil {
-    http.Error(w, err.Error(), http.StatusBadRequest)
-    return
-}
-```
-
-### Patch DOM Elements
-
-```go
-// Update HTML fragment (morphs existing DOM)
-sse.PatchElements(`<div id="counter">Count: 42</div>`)
-```
-
-### Merge Signals to Client
-
-```go
-// Update client-side signal state
-sse.MarshalAndPatchSignals(map[string]any{
-    "count": signals.Count + 1,
-})
-```
-
-### Complete Handler Example
-
-```go
-mux.HandleFunc("POST /increment", func(w http.ResponseWriter, r *http.Request) {
-    // 1. Read signals from client
-    var signals CounterSignals
-    if err := datastar.ReadSignals(r, &signals); err != nil {
-        http.Error(w, err.Error(), http.StatusBadRequest)
-        return
-    }
-
-    // 2. Process
-    nextCount := signals.Count + 1
-
-    // 3. Create SSE writer
-    sse := datastar.NewSSE(w, r)
-
-    // 4. Patch DOM if needed
-    sse.PatchElements(`<span id="count">${nextCount}</span>`)
-
-    // 5. Update client signals
-    sse.MarshalAndPatchSignals(map[string]any{
-        "count": nextCount,
-    })
-})
-```
-
-## Common Mistakes
-
-| Mistake | Correct |
-|---------|---------|
-| `data-signals-count="0"` | `data-signals="{ count: 0 }"` |
-| `data-on-click="@get('/api')"` | `data-on:click="@post('/api')"` |
-| `data-on-click="$$get('/api')"` | `data-on:click="@get('/api')"` (no $$) |
-| `data-text="count"` | `data-text="$count"` (with $) |
-| Manual SSE formatting | Use `datastar.NewSSE(w, r)` |
-| `fmt.Fprintf(w, "data: ...")` | Use `sse.PatchElements()` or `sse.MarshalAndPatchSignals()` |
-
-## SDK Wrapper Pattern (Option C)
-
-Wrap the official SDK in thin packages that provide your own API surface:
-
-```go
-// pkg/sse/sse.go — Thin wrapper around datastar-go
-package sse
-
-import (
-    "context"
-    "net/http"
-    "github.com/starfederation/datastar-go/datastar"
-)
-
-type SSEWriter struct {
-    gen *datastar.ServerSentEventGenerator
-}
-
-func NewSSE(w http.ResponseWriter, r *http.Request) *SSEWriter {
-    return &SSEWriter{gen: datastar.NewSSE(w, r)}
-}
-
-func (s *SSEWriter) PatchFragment(id, html string) error {
-    return s.gen.PatchElements(html)
-}
-
-func (s *SSEWriter) MergeSignals(signals map[string]any) error {
-    return s.gen.MarshalAndPatchSignals(signals)
-}
-
-func ReadSignals(r *http.Request, dest any) error {
-    return datastar.ReadSignals(r, dest)
-}
-```
-
-**Rule:** Wrapping the SDK is mandatory. The wrapper must align with standard library formats (e.g. `http.ResponseWriter` / `http.Handler` concepts) to decouple core app code from the external Datastar library API.
-
-
-## References
-
-- Official docs: https://data-star.dev
-- Go SDK: https://github.com/starfederation/datastar-go
-- Examples: https://data-star.dev/examples
-- Reference: https://data-star.dev/reference
+- `../server-rendered-ui/SKILL.md` — measuring and fixing flicker, jumps and duplicated
+  updates in an SSE-driven UI. Read alongside this skill.
+- Current API detail: the official DataStar documentation and the version your project pins.
