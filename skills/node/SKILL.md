@@ -224,9 +224,40 @@ try {
 | URL parsing | `new URL()` | url-parse |
 | Crypto | `node:crypto` | md5, uuid |
 | File read/write | `node:fs/promises` | fs-extra |
+| **WebSocket** | **global `WebSocket` (Node 22+)** | ws, socket.io |
+| Child process | `node:child_process` | execa, shelljs |
 | Testing | vitest (project standard) | jest |
 | Schema validation | `zod` | joi, yup, ajv |
 | Environment | `node:process.env` | dotenv |
+
+## Tooling: Reach for a Dependency Only When the Built-in Is Not Enough
+
+The built-ins table is not just a style preference. A runtime that ships the
+capability globally means a tool needs **zero** dependencies, which is worth
+more than convenience: no lockfile churn, no install step in CI, and a script
+that still runs in five years.
+
+The test that decides it: *would this tool still work if npm were unreachable?*
+If yes, it ships as a single file with no `node_modules`.
+
+| Situation | Use | Why |
+| --- | --- | --- |
+| Driving a real browser over the DevTools protocol | `WebSocket` (Node 22+) plus a `chrome-headless-shell` binary already on disk | The protocol is a JSON message loop. A full automation framework is hundreds of transitive packages to measure a box height. |
+| Spawning and supervising a process under test | `node:child_process` | Same. |
+| Anything that needs a maintained browser build matrix, device emulation, or recorded traces | the full automation framework | This is the line. Past it, the dependency earns itself. |
+
+Two rules for the zero-dependency version, both learned by getting them wrong:
+
+- **Drain or discard the child's stderr.** `stdio: 'pipe'` with nobody reading
+  fills the pipe buffer and blocks the process mid-request. The symptom looks
+  like a random hang, not a logging bug.
+- **Boot a fresh instance per run on a port you chose, and wait for a health
+  endpoint rather than sleeping.** A shared or already-running server makes the
+  test depend on state you did not set up.
+
+The payoff case: a ~200-line dependency-free driver outranked the application
+code it was written to test, on value per line. That is not a normal ratio and
+it is worth noticing when it happens — see `../server-rendered-ui/references/headless-measurement.md`.
 
 ## Common AI Mistakes to Avoid
 

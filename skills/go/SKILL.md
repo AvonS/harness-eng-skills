@@ -37,8 +37,35 @@ pkg/          ← importable library code
 internal/     ← private packages, never import from outside this module
 sql/          ← versioned .sql files (migrations: NNN_description.sql)
 testdata/     ← fixtures and golden files
+web/          ← templates, CSS, JS — embedded, never read from disk at runtime
 Makefile      ← build, test, lint, vet targets
 ```
+
+## Static Assets — `go:embed`
+
+Any project serving HTML, CSS, JS, or templates embeds them. Do not read files
+from disk at runtime, and do not fetch assets from a CDN.
+
+```go
+//go:embed web
+var webFS embed.FS
+```
+
+| Rule | Why |
+| --- | --- |
+| Embed assets; never serve from disk | The binary is the deployment unit. Disk paths break air-gapped deploys and container immutability. |
+| Never fetch a framework from a CDN | You cannot verify what you did not pin, and a floating tag makes behaviour depend on when the page loaded. |
+| **Embedded assets are greppable at build time** | This is the part that is easy to miss: because the CSS ships inside the binary, `grep` over the source tree resolves every framework class, custom property, and variant the UI actually uses. |
+
+That last row is a verification capability, not just a packaging one. Any claim
+about a framework's API — which class exists, which variants an element defines,
+what the cascade layer order is — becomes a one-line `grep` instead of a
+guess. Record the answers with the file you read them from; see
+`../server-rendered-ui/references/extension-pattern.md`.
+
+Served with a content hash or a version query so a deploy cannot be masked by a
+cached copy. A stylesheet change with no cache-bust is a bug report that
+reproduces for one user and not for you.
 
 ## Makefile
 
@@ -50,14 +77,16 @@ MODULE   := $(shell go list -m)
 VERSION  := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 LDFLAGS  := -s -w -X main.version=$(VERSION)
 
-.PHONY: all build test vet lint fmt clean tidy check
+.PHONY: all build test ui vet lint fmt clean tidy check
 
 all: check build
 
 build:
 	CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o bin/$(BINARY) ./cmd/$(BINARY)
 
-check: vet lint test
+# `ui` only exists if the project drives a real browser. It is in `check`, so it
+# runs on every commit — see the rule below.
+check: vet lint test ui
 
 vet:
 	go vet ./...
@@ -67,6 +96,9 @@ lint:
 
 test:
 	go test -race -count=1 ./...
+
+ui: build
+	node test/ui-regressions.mjs
 
 fmt:
 	gofumpt -l -w .
@@ -81,6 +113,13 @@ clean:
 ```
 
 **Agent rule:** Always use `make check` before committing.
+
+**Every check must be in the default target.** A test that is not reachable from
+`all` or `check` is a test that stops running within a month, and nobody notices
+because the suite is still green. This bites hardest on checks that live outside
+the language's own runner — browser-driven UI regressions, migration smoke tests,
+load tests. They are the checks most likely to be quietly orphaned, and usually
+the most valuable. If it caught a real bug once, it belongs in `check`.
 
 ## CGO and Cross-Compilation
 
@@ -107,6 +146,13 @@ build-cgo:
 - Test file: same package as code (`package foo`, not `package foo_test`) unless testing public API
 - Coverage target: >80% for `pkg/`, >60% for `cmd/`
 - Use `t.Helper()` in test helpers and `t.Cleanup()` for test teardown
+- **Revert each fix and confirm its test fails, one fix at a time.** A test that
+  passes against the code it was written for reports safety that is not there.
+  Reverting the whole set proves nothing: two fixes can mask each other, so the
+  suite passes with both broken. Revert one, confirm red, restore, repeat.
+- **A test that never failed is not a test.** If you cannot make it fail, you do
+  not know what it asserts — usually the selector is too loose or the assertion
+  is on a wrapper rather than the thing that moved.
 
 ## Error Handling
 
@@ -254,6 +300,14 @@ func (r *statusRecorder) Flush() {
     }
 }
 ```
+
+A wrapper that forgets `Flush` compiles, passes every test, and streams
+nothing — the client waits for the whole response and the symptom is a slow
+page, not an error. Assert that bytes arrive before the handler returns.
+
+For flicker, duplicate delivery, gap detection, and how to measure any of it,
+read `../server-rendered-ui/SKILL.md`. The Go mechanics are here; the delivery
+semantics are there.
 
 ## API Error Format
 

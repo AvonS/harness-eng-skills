@@ -33,13 +33,22 @@ description: >
 4. **Never let colour carry state that layout should carry.** If a box changes colour to
    signal a state, it will read as a flash every time the state toggles. Signal state with
    text, an icon, or position, and hold the colour still.
-5. **Revert each fix and confirm the test fails.** A regression test that passes against
-   the broken code is worse than no test, because it reports safety that is not there.
+5. **Revert each fix and confirm the test fails — one fix at a time.** A regression
+   test that passes against the broken code is worse than no test, because it
+   reports safety that is not there. Reverting the whole set proves nothing:
+   two fixes can mask each other, so the suite can pass with both broken. Revert
+   one, confirm red, restore, repeat.
 6. **Prefer the value that already dominates.** When collapsing several values into one,
    pick the one the UI already shows most often, not the one that reads as semantically
    correct. A one-line change that preserves the common appearance beats a redesign.
 7. **Fix the harness before you believe it.** A surprising result is far more often a bug
    in the measuring code than a finding. See "Harness bugs that produced fake results".
+8. **A flag that changes timing also changes what is observable.** A test or dev flag
+   that shortens a delay, skips a step, or forces a fast path also removes states
+   from the client — so any conclusion you draw under it is about the flag, not
+   the product. This invalidates conclusions about transient states specifically,
+   because the states are what the flag removed. Measure the real timing at least
+   once, in a second instance, before believing a "this never renders" result.
 
 ## What "Stable" Means
 
@@ -157,6 +166,36 @@ Applies to any server-rendered UI pushed or patched over the wire.
 | No gap detection | a dropped update leaves the UI permanently wrong with no signal | monotonic version per state, client compares |
 | Server work done synchronously inside a request | intermediate states never exist on the client, so waiting is invisible to the user | if the user waits, render the waiting state |
 | Patch scoped too narrowly | part of the page updates and the rest does not, which reads as a flicker | patch the smallest region that is genuinely self-contained, and measure that region |
+
+## After the Fix: Separate Load-Bearing From Incidental
+
+The suite is green. That is the point to review the design, because the fix has
+just made several decisions look justified that were only ever accidents of the
+old layout. Judge from measured behaviour, not from the fact that it now works.
+
+| Verdict | Meaning | Action |
+| --- | --- | --- |
+| **Load-bearing** | The invariant holds because the structure guarantees it | Keep. This is the win. |
+| **Incidental** | It holds for reasons unrelated to the structure | Fine, but do not build on it |
+| **Load-bearing by accident** | A hack that now carries a real invariant | Document it *and* file the structural fix |
+
+The third row is the one worth hunting for. Placeholders, fixed heights,
+reserved slots, and counters that exist because something else once leaked tend
+to absorb an invariant during a fix and then quietly become the reason nobody
+dared change them. The giveaway is a construct whose stated purpose no longer
+matches what it is doing.
+
+Two reviews are worth writing down, because both change what you build next:
+
+- **What was the most valuable artefact?** Often the answer is the measurement
+  harness, not the application. A harness that turned "it flickers" into numbers
+  and found causes reading the code had missed is core tooling — keep it in the
+  default build target, treat it as a maintained component, and do not file it
+  as a test detail.
+- **What is now a symptom?** Every item in the *load-bearing by accident* row is
+  a follow-up. Order them by observed value, not by how annoying they feel, and
+  resist starting them piecemeal — if two of them share a root cause, doing one
+  without the other is the incoherent option.
 
 ## Accessibility Is Not Optional
 
